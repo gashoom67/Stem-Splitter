@@ -1,0 +1,7 @@
+# For NVIDIA GPU acceleration on Windows, install the CUDA build of torch first (see README).
+torch>=2.1
+demucs>=4.0.1
+numpy
+fastapi>=0.110
+uvicorn[standard]>=0.29
+python-multipart>=0.0.9

@@ -1,0 +1,744 @@
+<!doctype html>
+<!--
+  Stem Splitter — frontend (served by app.py at http://127.0.0.1:8000)
+
+  Flow:
+    1. Upload    → POST /api/separate            (returns a job id)
+    2. Progress  → GET  /api/jobs/{id}           (polled until status == "done")
+    3. Load      → GET  /api/jobs/{id}/vocals.mp3 + instrumental.mp3
+                   decoded with the Web Audio API into AudioBuffers
+    4. Play      → both buffers start on the SAME AudioContext clock tick, so they are
+                   sample-accurately in sync. Each runs through its own GainNode
+                   (the lane's volume slider / mute / solo).
+    5. Waveform  → drawn on one <canvas>: timeline ruler + one bar-style lane per stem,
+                   with a draggable playhead. Bar height follows the lane's gain.
+    6. Export    → GET /api/jobs/{id}/mix.mp3?vocals=G1&instrumental=G2
+                   (server mixes the lossless stems at exactly those gains)
+-->
+<html lang="en" class="dark">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Stem Splitter</title>
+  <script src="https://cdn.tailwindcss.com"></script>
+  <link rel="preconnect" href="https://fonts.googleapis.com" />
+  <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500&display=swap" rel="stylesheet" />
+  <style>
+    :root {
+      --bg: #0a0c0f;
+      --panel: #11141a;
+      --panel-2: #161a21;
+      --line: #222833;
+      --text: #e6e9ef;
+      --muted: #8a93a3;
+      --vox: #4fe3c1;          /* vocals lane colour */
+      --inst: #f6a93b;         /* instrumental lane colour */
+    }
+    html, body { background: var(--bg); color: var(--text); font-family: Inter, system-ui, sans-serif; }
+    .mono { font-family: "JetBrains Mono", ui-monospace, monospace; font-variant-numeric: tabular-nums; }
+    .panel { background: var(--panel); border: 1px solid var(--line); }
+
+    /* Dropzone */
+    #dropzone.drag { border-color: var(--vox); background: rgba(79, 227, 193, .06); }
+
+    /* Volume sliders: thin track, filled up to the thumb in the lane colour */
+    input[type=range].fader {
+      -webkit-appearance: none; appearance: none; width: 100%; height: 22px; background: transparent; cursor: pointer;
+    }
+    input[type=range].fader::-webkit-slider-runnable-track {
+      height: 4px; border-radius: 4px;
+      background: linear-gradient(to right, var(--c) 0 var(--p), #2a313d var(--p) 100%);
+    }
+    input[type=range].fader::-moz-range-track { height: 4px; border-radius: 4px; background: #2a313d; }
+    input[type=range].fader::-moz-range-progress { height: 4px; border-radius: 4px; background: var(--c); }
+    input[type=range].fader::-webkit-slider-thumb {
+      -webkit-appearance: none; width: 14px; height: 14px; border-radius: 50%; margin-top: -5px;
+      background: #f2f4f8; border: 3px solid var(--c); box-shadow: 0 0 0 3px rgba(0,0,0,.35);
+    }
+    input[type=range].fader::-moz-range-thumb {
+      width: 10px; height: 10px; border-radius: 50%; background: #f2f4f8; border: 3px solid var(--c);
+    }
+    input[type=range].zoom { --c: #6b7686; }
+
+    .chip-btn { border: 1px solid var(--line); background: var(--panel-2); color: var(--muted); }
+    .chip-btn:hover { color: var(--text); border-color: #3a4252; }
+    .chip-btn[aria-pressed=true].mute { background: #3b1d22; color: #ff8a9a; border-color: #6b2a35; }
+    .chip-btn[aria-pressed=true].solo { background: #3a3317; color: #ffd866; border-color: #6b5a1f; }
+    .chip-btn[aria-pressed=true].follow { color: var(--text); border-color: #3a4252; }
+
+    #wave { cursor: text; touch-action: none; display: block; }
+    #scrollbar { scrollbar-color: #39414e transparent; }
+    #scrollbar::-webkit-scrollbar { height: 8px; }
+    #scrollbar::-webkit-scrollbar-thumb { background: #39414e; border-radius: 8px; }
+
+    .spin { animation: spin 0.9s linear infinite; }
+    @keyframes spin { to { transform: rotate(360deg); } }
+    .bar-stripes {
+      background-image: linear-gradient(90deg, var(--vox), #7bd3ff 60%, var(--inst));
+    }
+  </style>
+</head>
+<body class="min-h-screen antialiased">
+  <div class="max-w-6xl mx-auto px-4 sm:px-6 py-8">
+
+    <!-- ── Header ─────────────────────────────────────────────── -->
+    <header class="flex items-center justify-between mb-8">
+      <div class="flex items-center gap-3">
+        <div class="w-9 h-9 rounded-lg grid place-items-center" style="background:linear-gradient(135deg,var(--vox),var(--inst))">
+          <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="#0a0c0f" stroke-width="2.4" stroke-linecap="round"><path d="M4 10v4M8 6v12M12 9v6M16 4v16M20 10v4"/></svg>
+        </div>
+        <div>
+          <h1 class="text-lg font-semibold tracking-tight leading-none">Stem Splitter</h1>
+          <p class="text-xs mt-1" style="color:var(--muted)">AI vocal / instrumental separation · runs 100% on your machine</p>
+        </div>
+      </div>
+      <span id="engineInfo" class="mono text-[11px] px-2.5 py-1 rounded-full chip-btn">connecting…</span>
+    </header>
+
+    <!-- ── 1. Upload ──────────────────────────────────────────── -->
+    <section id="uploadSection">
+      <label id="dropzone" for="fileInput"
+             class="block rounded-2xl border-2 border-dashed cursor-pointer transition-colors px-6 py-16 text-center"
+             style="border-color:var(--line);background:var(--panel)">
+        <input id="fileInput" type="file" accept=".mp3,.wav,.flac,.m4a,.aac,.ogg,.opus,.aiff,.aif,audio/*" class="hidden" />
+        <div class="mx-auto w-14 h-14 rounded-full grid place-items-center mb-4" style="background:var(--panel-2)">
+          <svg width="26" height="26" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" style="color:var(--vox)"><path d="M12 16V4M7 9l5-5 5 5"/><path d="M4 16v2a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2v-2"/></svg>
+        </div>
+        <p class="text-base font-medium">Drop an audio file here, or <span style="color:var(--vox)">browse</span></p>
+        <p class="text-sm mt-1.5" style="color:var(--muted)">MP3 · WAV · FLAC · M4A — separated locally with Demucs</p>
+      </label>
+    </section>
+
+    <!-- ── 2. Processing ──────────────────────────────────────── -->
+    <section id="progressSection" class="hidden panel rounded-2xl p-6">
+      <div class="flex items-center gap-3 mb-4">
+        <svg class="spin shrink-0" width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="var(--vox)" stroke-width="2.5" stroke-linecap="round"><path d="M12 3a9 9 0 1 0 9 9"/></svg>
+        <div class="min-w-0">
+          <p id="progressFile" class="font-medium truncate">—</p>
+          <p id="progressMsg" class="text-sm" style="color:var(--muted)">Uploading…</p>
+        </div>
+        <span id="progressPct" class="mono ml-auto text-sm" style="color:var(--muted)">0%</span>
+      </div>
+      <div class="h-1.5 rounded-full overflow-hidden" style="background:var(--panel-2)">
+        <div id="progressBar" class="h-full bar-stripes transition-[width] duration-500" style="width:0%"></div>
+      </div>
+      <p class="text-xs mt-3" style="color:var(--muted)">On a CPU a 3-minute song usually takes 1–4 minutes; with an NVIDIA GPU it takes seconds.</p>
+    </section>
+
+    <!-- ── 3. Editor ──────────────────────────────────────────── -->
+    <section id="editorSection" class="hidden">
+      <!-- File bar -->
+      <div class="flex flex-wrap items-center gap-3 mb-4">
+        <div class="min-w-0">
+          <p class="text-xs uppercase tracking-wider" style="color:var(--muted)">Now editing</p>
+          <p id="trackName" class="font-semibold truncate max-w-[60vw]">—</p>
+        </div>
+        <button id="newFileBtn" class="ml-auto chip-btn rounded-lg px-3 py-2 text-sm">Separate another file</button>
+      </div>
+
+      <div class="panel rounded-2xl overflow-hidden">
+        <!-- Transport -->
+        <div class="flex flex-wrap items-center gap-4 px-4 py-3 border-b" style="border-color:var(--line);background:var(--panel-2)">
+          <button id="playBtn" aria-label="Play"
+                  class="w-11 h-11 rounded-full grid place-items-center transition-transform active:scale-95"
+                  style="background:var(--text);color:var(--bg)">
+            <svg id="playIcon" width="18" height="18" viewBox="0 0 24 24" fill="currentColor"><path d="M7 4.5v15l13-7.5z"/></svg>
+            <svg id="pauseIcon" class="hidden" width="18" height="18" viewBox="0 0 24 24" fill="currentColor"><rect x="6" y="4.5" width="4" height="15" rx="1"/><rect x="14" y="4.5" width="4" height="15" rx="1"/></svg>
+          </button>
+          <button id="stopBtn" aria-label="Back to start" class="chip-btn w-9 h-9 rounded-full grid place-items-center">
+            <svg width="14" height="14" viewBox="0 0 24 24" fill="currentColor"><rect x="4" y="5" width="3" height="14" rx="1"/><path d="M20 5v14L9 12z"/></svg>
+          </button>
+          <div class="mono text-lg leading-none">
+            <span id="timeNow">0:00.00</span><span style="color:var(--muted)"> / <span id="timeTotal">0:00.00</span></span>
+          </div>
+          <div class="ml-auto flex items-center gap-3 text-xs" style="color:var(--muted)">
+            <button id="followBtn" class="chip-btn follow rounded-md px-2.5 py-1.5" aria-pressed="true" title="Keep the playhead in view">Follow</button>
+            <span>Zoom</span>
+            <input id="zoom" type="range" class="fader zoom w-32" min="0" max="1000" value="0" style="--p:0%" />
+            <button id="fitBtn" class="chip-btn rounded-md px-2.5 py-1.5">Fit</button>
+          </div>
+        </div>
+
+        <!-- Lanes: headers on the left, one shared canvas on the right -->
+        <div class="flex">
+          <div class="w-56 shrink-0 border-r" style="border-color:var(--line)">
+            <div class="h-[30px] border-b" style="border-color:var(--line);background:var(--panel-2)"></div>
+            <div id="laneHeaders"></div>
+          </div>
+          <div class="flex-1 min-w-0 relative">
+            <div id="waveWrap" class="relative"><canvas id="wave"></canvas></div>
+            <div id="scrollbar" class="overflow-x-auto overflow-y-hidden" style="height:12px"><div id="scrollInner" style="height:1px"></div></div>
+          </div>
+        </div>
+
+        <!-- Export -->
+        <div class="flex flex-wrap items-center gap-3 px-4 py-4 border-t" style="border-color:var(--line);background:var(--panel-2)">
+          <button id="mixBtn" class="rounded-lg px-4 py-2.5 text-sm font-semibold flex items-center gap-2 disabled:opacity-60"
+                  style="background:linear-gradient(135deg,var(--vox),#7bd3ff);color:#06231d">
+            <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round"><path d="M12 4v12M7 11l5 5 5-5M5 20h14"/></svg>
+            <span id="mixBtnText">Download Mixed MP3</span>
+          </button>
+          <span id="mixInfo" class="mono text-xs" style="color:var(--muted)"></span>
+          <div class="ml-auto flex gap-2 text-sm">
+            <a id="dlVocals" class="chip-btn rounded-lg px-3 py-2" download>Vocals MP3</a>
+            <a id="dlInst" class="chip-btn rounded-lg px-3 py-2" download>Instrumental MP3</a>
+          </div>
+        </div>
+      </div>
+      <p class="text-xs mt-3" style="color:var(--muted)">
+        Space play/pause · ← → skip 5 s · Home back to start · click or drag the waveform to scrub · Ctrl/⌘ + scroll to zoom · double-click a fader to reset it
+      </p>
+    </section>
+
+    <!-- Toast for errors -->
+    <div id="toast" class="hidden fixed bottom-6 left-1/2 -translate-x-1/2 max-w-lg rounded-xl px-4 py-3 text-sm shadow-2xl"
+         style="background:#2a1418;border:1px solid #6b2a35;color:#ffc2cb"></div>
+  </div>
+
+<script>
+/* ════════════════════════════════════════════════════════════════════
+   Small helpers
+   ════════════════════════════════════════════════════════════════════ */
+const $ = (id) => document.getElementById(id);
+const clamp = (v, a, b) => Math.min(b, Math.max(a, v));
+const show = (el, on = true) => el.classList.toggle("hidden", !on);
+
+function fmtTime(t, centis = true) {
+  t = Math.max(0, t);
+  const m = Math.floor(t / 60), s = Math.floor(t % 60);
+  const base = `${m}:${String(s).padStart(2, "0")}`;
+  return centis ? `${base}.${String(Math.floor((t % 1) * 100)).padStart(2, "0")}` : base;
+}
+
+let toastTimer;
+function toast(msg) {
+  const el = $("toast");
+  el.textContent = msg; show(el);
+  clearTimeout(toastTimer); toastTimer = setTimeout(() => show(el, false), 7000);
+}
+
+/* ════════════════════════════════════════════════════════════════════
+   App state
+   ════════════════════════════════════════════════════════════════════ */
+const STEMS = [
+  { key: "vocals",       label: "Vocals",       color: getComputedStyle(document.documentElement).getPropertyValue("--vox").trim() },
+  { key: "instrumental", label: "Instrumental", color: getComputedStyle(document.documentElement).getPropertyValue("--inst").trim() },
+];
+const state = {
+  jobId: null,
+  filename: "",
+  duration: 0,
+  lanes: {},          // key -> { buffer, peaks, gain(slider), muted, solo, node(GainNode), els }
+};
+
+/* ════════════════════════════════════════════════════════════════════
+   Engine info chip
+   ════════════════════════════════════════════════════════════════════ */
+fetch("/api/info").then(r => r.json()).then(i => {
+  $("engineInfo").textContent = `${i.model} · ${i.device.toUpperCase()}`;
+}).catch(() => { $("engineInfo").textContent = "server offline"; });
+
+/* ════════════════════════════════════════════════════════════════════
+   1. Upload (drag & drop or file picker)
+   ════════════════════════════════════════════════════════════════════ */
+const dz = $("dropzone");
+["dragenter", "dragover"].forEach(ev => dz.addEventListener(ev, e => { e.preventDefault(); dz.classList.add("drag"); }));
+["dragleave", "drop"].forEach(ev => dz.addEventListener(ev, e => { e.preventDefault(); dz.classList.remove("drag"); }));
+dz.addEventListener("drop", e => { const f = e.dataTransfer.files[0]; if (f) startJob(f); });
+$("fileInput").addEventListener("change", e => { const f = e.target.files[0]; if (f) startJob(f); e.target.value = ""; });
+// Also accept a drop anywhere on the page while the uploader is visible.
+window.addEventListener("dragover", e => e.preventDefault());
+window.addEventListener("drop", e => {
+  e.preventDefault();
+  if (!$("uploadSection").classList.contains("hidden") && e.target.closest("#dropzone") == null) {
+    const f = e.dataTransfer.files[0]; if (f) startJob(f);
+  }
+});
+
+const OK_EXT = /\.(mp3|wav|flac|m4a|aac|ogg|opus|aiff?|wma)$/i;
+
+function startJob(file) {
+  if (!OK_EXT.test(file.name)) return toast("Please choose an MP3, WAV, FLAC or M4A file.");
+  state.filename = file.name;
+  show($("uploadSection"), false); show($("editorSection"), false); show($("progressSection"));
+  $("progressFile").textContent = file.name;
+  setProgress(0, "Uploading…");
+
+  // XHR (instead of fetch) so we can show upload progress for big WAV/FLAC files.
+  const form = new FormData(); form.append("file", file);
+  const xhr = new XMLHttpRequest();
+  xhr.open("POST", "/api/separate");
+  xhr.upload.onprogress = e => {
+    if (e.lengthComputable) setProgress(0.05 * e.loaded / e.total, `Uploading… ${Math.round(100 * e.loaded / e.total)}%`);
+  };
+  xhr.onload = () => {
+    let body = {}; try { body = JSON.parse(xhr.responseText); } catch {}
+    if (xhr.status !== 200) return failJob(body.detail || `Upload failed (${xhr.status})`);
+    state.jobId = body.job_id;
+    pollJob();
+  };
+  xhr.onerror = () => failJob("Could not reach the local server. Is app.py still running?");
+  xhr.send(form);
+}
+
+function setProgress(p, msg) {
+  const pct = Math.round(p * 100);
+  $("progressBar").style.width = pct + "%";
+  $("progressPct").textContent = pct + "%";
+  if (msg) $("progressMsg").textContent = msg;
+}
+
+function failJob(msg) {
+  toast(msg);
+  show($("progressSection"), false); show($("uploadSection"));
+}
+
+/* ════════════════════════════════════════════════════════════════════
+   2. Poll the background separation job
+   ════════════════════════════════════════════════════════════════════ */
+async function pollJob() {
+  try {
+    const r = await fetch(`/api/jobs/${state.jobId}`);
+    const j = await r.json();
+    if (!r.ok) return failJob(j.detail || "Job not found");
+    if (j.status === "error") return failJob("Separation failed: " + j.message);
+    setProgress(j.status === "done" ? 0.97 : j.progress, j.message);
+    if (j.status === "done") { state.duration = j.duration; return loadStems(); }
+  } catch { return failJob("Lost connection to the local server."); }
+  setTimeout(pollJob, 800);
+}
+
+/* ════════════════════════════════════════════════════════════════════
+   3. Load both stems into the Web Audio API
+   ════════════════════════════════════════════════════════════════════ */
+let ctx, master;            // AudioContext + master gain
+function ensureAudio() {
+  if (!ctx) {
+    ctx = new (window.AudioContext || window.webkitAudioContext)();
+    master = ctx.createGain(); master.connect(ctx.destination);
+  }
+  return ctx;
+}
+
+async function loadStems() {
+  setProgress(0.98, "Loading stems into the player…");
+  ensureAudio();
+  try {
+    const buffers = await Promise.all(STEMS.map(async s => {
+      const res = await fetch(`/api/jobs/${state.jobId}/${s.key}.mp3`);
+      if (!res.ok) throw new Error(`Could not load ${s.label} (${res.status})`);
+      return ctx.decodeAudioData(await res.arrayBuffer());
+    }));
+    // Shared peak normalisation so the two lanes show their real relative loudness.
+    const raw = buffers.map(computePeaks);
+    const top = Math.max(0.05, ...raw.map(p => p.max));
+    STEMS.forEach((s, i) => {
+      const node = state.lanes[s.key]?.node || ctx.createGain();   // reuse the GainNode between songs
+      node.connect(master);
+      state.lanes[s.key] = { gain: 1, muted: false, solo: false, node,
+                             buffer: buffers[i], peaks: raw[i].data.map(v => v / top) };
+    });
+    state.duration = Math.max(...buffers.map(b => b.duration));
+  } catch (e) { return failJob(e.message); }
+
+  setProgress(1, "Ready");
+  openEditor();
+}
+
+/* Peak "mipmap": max |sample| over both channels for every block of 256 samples.
+   The waveform renderer then only has to scan ~100 numbers per bar. */
+const BLOCK = 256;
+function computePeaks(buffer) {
+  const n = Math.ceil(buffer.length / BLOCK);
+  const data = new Float32Array(n);
+  let max = 0;
+  for (let c = 0; c < buffer.numberOfChannels; c++) {
+    const ch = buffer.getChannelData(c);
+    for (let b = 0; b < n; b++) {
+      let m = data[b];
+      const end = Math.min(ch.length, (b + 1) * BLOCK);
+      for (let i = b * BLOCK; i < end; i++) { const v = ch[i] < 0 ? -ch[i] : ch[i]; if (v > m) m = v; }
+      data[b] = m; if (m > max) max = m;
+    }
+  }
+  return { data, max };
+}
+
+/* ════════════════════════════════════════════════════════════════════
+   4. Synchronised playback engine
+      Both AudioBufferSourceNodes are started with the same ctx time,
+      so the stems stay locked together at sample level.
+   ════════════════════════════════════════════════════════════════════ */
+const player = {
+  playing: false,
+  sources: [],
+  startCtxTime: 0,   // ctx.currentTime when playback started
+  startOffset: 0,    // song position (s) at that moment
+  pausedAt: 0,       // song position while paused
+
+  time() {
+    return this.playing ? this.startOffset + (ctx.currentTime - this.startCtxTime) : this.pausedAt;
+  },
+  async play() {
+    ensureAudio(); await ctx.resume();
+    if (this.pausedAt >= state.duration - 0.01) this.pausedAt = 0;
+    const when = ctx.currentTime + 0.03;              // tiny lead so both start on the same tick
+    this.sources = STEMS.map(s => {
+      const src = ctx.createBufferSource();
+      src.buffer = state.lanes[s.key].buffer;
+      src.connect(state.lanes[s.key].node);
+      src.start(when, this.pausedAt);
+      return src;
+    });
+    this.startCtxTime = when; this.startOffset = this.pausedAt; this.playing = true;
+    updatePlayButton(); loop();
+  },
+  pause() {
+    if (!this.playing) return;
+    this.pausedAt = clamp(this.time(), 0, state.duration);
+    this.sources.forEach(s => { try { s.stop(); } catch {} });
+    this.sources = []; this.playing = false;
+    updatePlayButton(); draw();
+  },
+  toggle() { this.playing ? this.pause() : this.play(); },
+  seek(t) {
+    t = clamp(t, 0, state.duration);
+    if (this.playing) { this.pause(); this.pausedAt = t; this.play(); }
+    else { this.pausedAt = t; draw(); }
+  },
+};
+
+function updatePlayButton() {
+  show($("playIcon"), !player.playing); show($("pauseIcon"), player.playing);
+  $("playBtn").setAttribute("aria-label", player.playing ? "Pause" : "Play");
+}
+
+/* Effective gain = slider value, unless muted or another lane is soloed. */
+function effectiveGain(key) {
+  const lane = state.lanes[key];
+  const anySolo = STEMS.some(s => state.lanes[s.key].solo);
+  if (lane.muted || (anySolo && !lane.solo)) return 0;
+  return lane.gain;
+}
+function applyGains() {
+  STEMS.forEach(s => {
+    const lane = state.lanes[s.key];
+    lane.node.gain.setTargetAtTime(effectiveGain(s.key), ctx.currentTime, 0.015);  // click-free ramp
+  });
+  updateMixInfo(); draw();
+}
+
+/* ════════════════════════════════════════════════════════════════════
+   5. Lane headers (name, mute/solo, volume fader, stem download)
+   ════════════════════════════════════════════════════════════════════ */
+const RULER_H = 30, LANE_H = 116;
+
+function buildLaneHeaders() {
+  const host = $("laneHeaders"); host.innerHTML = "";
+  STEMS.forEach(s => {
+    const lane = state.lanes[s.key];
+    const el = document.createElement("div");
+    el.className = "px-4 py-3 border-b flex flex-col justify-between";
+    el.style.cssText = `height:${LANE_H}px;border-color:var(--line)`;
+    el.innerHTML = `
+      <div class="flex items-center gap-2">
+        <span class="w-2.5 h-2.5 rounded-full" style="background:${s.color}"></span>
+        <span class="font-medium text-sm">${s.label}</span>
+        <div class="ml-auto flex gap-1">
+          <button class="chip-btn mute rounded w-6 h-6 text-[11px] font-semibold" aria-pressed="false" title="Mute">M</button>
+          <button class="chip-btn solo rounded w-6 h-6 text-[11px] font-semibold" aria-pressed="false" title="Solo">S</button>
+        </div>
+      </div>
+      <div>
+        <div class="flex justify-between text-[11px] mb-0.5" style="color:var(--muted)">
+          <span>Volume</span><span class="mono vol-readout"></span>
+        </div>
+        <input type="range" class="fader" min="0" max="200" step="1" value="${Math.round(lane.gain * 100)}"
+               style="--c:${s.color}" aria-label="${s.label} volume" />
+      </div>`;
+    const fader = el.querySelector("input"), readout = el.querySelector(".vol-readout");
+    const muteBtn = el.querySelector(".mute"), soloBtn = el.querySelector(".solo");
+    const sync = () => {
+      const v = Number(fader.value);
+      fader.style.setProperty("--p", (v / 2) + "%");
+      const db = v === 0 ? "-∞" : (20 * Math.log10(v / 100)).toFixed(1);
+      readout.textContent = `${v}% · ${db} dB`;
+      muteBtn.setAttribute("aria-pressed", lane.muted); soloBtn.setAttribute("aria-pressed", lane.solo);
+    };
+    fader.addEventListener("input", () => { lane.gain = fader.value / 100; sync(); applyGains(); });
+    fader.addEventListener("dblclick", () => { fader.value = 100; lane.gain = 1; sync(); applyGains(); });
+    muteBtn.addEventListener("click", () => { lane.muted = !lane.muted; sync(); applyGains(); });
+    soloBtn.addEventListener("click", () => { lane.solo = !lane.solo; sync(); applyGains(); });
+    sync();
+    host.appendChild(el);
+  });
+}
+
+function updateMixInfo() {
+  const v = effectiveGain("vocals"), i = effectiveGain("instrumental");
+  $("mixInfo").textContent = `vocals ${Math.round(v * 100)}% · instrumental ${Math.round(i * 100)}%`;
+}
+
+/* ════════════════════════════════════════════════════════════════════
+   6. Waveform canvas: ruler + bar lanes + playhead, drawn for the
+      visible window only (so any zoom level and song length is cheap).
+   ════════════════════════════════════════════════════════════════════ */
+const canvas = $("wave"), g = canvas.getContext("2d");
+const view = { width: 0, pps: 50, minPps: 1, maxPps: 500, scrollX: 0, follow: true, hoverX: null, scrubT: null };
+const BAR_W = 2, BAR_GAP = 1, BAR_STEP = BAR_W + BAR_GAP;
+
+function resizeCanvas() {
+  const w = $("waveWrap").clientWidth, h = RULER_H + LANE_H * STEMS.length;
+  const dpr = window.devicePixelRatio || 1;
+  canvas.width = Math.round(w * dpr); canvas.height = Math.round(h * dpr);
+  canvas.style.width = w + "px"; canvas.style.height = h + "px";
+  g.setTransform(dpr, 0, 0, dpr, 0, 0);
+  const wasFit = Math.abs(view.pps - view.minPps) < 1e-6;
+  view.width = w;
+  view.minPps = w / Math.max(state.duration, 0.1);         // "fit": whole song visible
+  view.maxPps = Math.max(view.minPps * 2, 500);
+  if (wasFit || view.pps < view.minPps) view.pps = view.minPps;
+  syncScroll(); draw();
+}
+new ResizeObserver(() => { if (state.duration) resizeCanvas(); }).observe($("waveWrap"));
+
+/* Zoom slider is logarithmic between "fit" and maxPps. */
+function setZoom(pps, anchorX = view.width / 2) {
+  const anchorT = (view.scrollX + anchorX) / view.pps;
+  view.pps = clamp(pps, view.minPps, view.maxPps);
+  view.scrollX = anchorT * view.pps - anchorX;
+  const z = Math.log(view.pps / view.minPps) / Math.log(view.maxPps / view.minPps);
+  $("zoom").value = Math.round((isFinite(z) ? z : 0) * 1000);
+  $("zoom").style.setProperty("--p", ($("zoom").value / 10) + "%");
+  syncScroll(); draw();
+}
+$("zoom").addEventListener("input", e => {
+  const z = e.target.value / 1000;
+  setZoom(view.minPps * Math.pow(view.maxPps / view.minPps, z), playheadX() ?? view.width / 2);
+});
+$("fitBtn").addEventListener("click", () => setZoom(view.minPps));
+$("followBtn").addEventListener("click", e => {
+  view.follow = !view.follow; e.currentTarget.setAttribute("aria-pressed", view.follow);
+});
+
+/* Horizontal scrolling uses a native scrollbar strip under the canvas. */
+const sb = $("scrollbar");
+function totalWidth() { return state.duration * view.pps; }
+function syncScroll() {
+  view.scrollX = clamp(view.scrollX, 0, Math.max(0, totalWidth() - view.width));
+  $("scrollInner").style.width = totalWidth() + "px";
+  if (Math.abs(sb.scrollLeft - view.scrollX) > 0.5) sb.scrollLeft = view.scrollX;
+}
+sb.addEventListener("scroll", () => { view.scrollX = sb.scrollLeft; draw(); });
+canvas.addEventListener("wheel", e => {
+  if (e.ctrlKey || e.metaKey) {                       // pinch / ctrl+wheel → zoom around cursor
+    e.preventDefault();
+    setZoom(view.pps * Math.exp(-e.deltaY * 0.01), e.offsetX);
+  } else if (Math.abs(e.deltaX) > Math.abs(e.deltaY) || e.shiftKey) {
+    e.preventDefault();
+    view.scrollX += e.shiftKey ? e.deltaY : e.deltaX; syncScroll(); draw();
+  }
+}, { passive: false });
+
+const xToTime = x => (view.scrollX + x) / view.pps;
+const timeToX = t => t * view.pps - view.scrollX;
+function playheadX() { const x = timeToX(currentT()); return x >= 0 && x <= view.width ? x : null; }
+function currentT() { return view.scrubT ?? player.time(); }
+
+/* Pick a "nice" ruler spacing so labels are ≥ ~70 px apart. */
+function rulerSteps() {
+  const nice = [0.1, 0.25, 0.5, 1, 2, 5, 10, 15, 30, 60, 120, 300, 600];
+  const major = nice.find(s => s * view.pps >= 70) ?? 600;
+  const minor = major >= 60 ? major / 6 : major >= 10 ? major / 5 : major >= 1 ? major / (major === 2 ? 4 : 5) : major / 5;
+  return { major, minor };
+}
+function fmtRuler(t, major) {
+  if (major < 1) {
+    const m = Math.floor(t / 60), s = (t % 60);
+    return `${m}:${s.toFixed(major < 0.5 ? 2 : 1).padStart(major < 0.5 ? 5 : 4, "0")}`;
+  }
+  return fmtTime(t + 1e-6, false);
+}
+
+function draw() {
+  if (!state.duration || !view.width) return;
+  const W = view.width, H = RULER_H + LANE_H * STEMS.length;
+  const css = getComputedStyle(document.documentElement);
+  g.clearRect(0, 0, W, H);
+
+  // ── Ruler ──
+  g.fillStyle = "#161a21"; g.fillRect(0, 0, W, RULER_H);
+  const { major, minor } = rulerSteps();
+  const t0 = xToTime(0), t1 = xToTime(W);
+  g.font = '500 10px "JetBrains Mono", monospace'; g.textBaseline = "top";
+  for (let t = Math.floor(t0 / minor) * minor; t <= t1 + minor; t += minor) {
+    if (t < 0 || t > state.duration + 1e-6) continue;
+    const x = Math.round(timeToX(t)) + 0.5;
+    const isMajor = Math.abs(t / major - Math.round(t / major)) < 1e-6;
+    g.strokeStyle = isMajor ? "#4a5363" : "#2c333f";
+    g.beginPath(); g.moveTo(x, isMajor ? 14 : 22); g.lineTo(x, RULER_H); g.stroke();
+    if (isMajor) { g.fillStyle = "#8a93a3"; g.fillText(fmtRuler(t, major), x + 4, 4); }
+  }
+  g.fillStyle = "#222833"; g.fillRect(0, RULER_H - 1, W, 1);
+
+  // ── Lanes ──
+  const tNow = currentT(), xNow = timeToX(tNow);
+  const anySolo = STEMS.some(s => state.lanes[s.key].solo);
+  STEMS.forEach((s, li) => {
+    const lane = state.lanes[s.key];
+    const top = RULER_H + li * LANE_H, mid = top + LANE_H / 2, half = LANE_H / 2 - 10;
+    const gain = effectiveGain(s.key);
+    const silent = gain === 0;
+    const sr = lane.buffer.sampleRate;
+
+    g.fillStyle = li % 2 ? "#0f1217" : "#11141a"; g.fillRect(0, top, W, LANE_H);
+    g.fillStyle = "#1c212a"; g.fillRect(0, mid, W, 1);                     // centre line
+
+    // Bars snapped to a fixed grid in song-pixels so they don't shimmer while scrolling.
+    const firstBar = Math.floor(view.scrollX / BAR_STEP);
+    const nBars = Math.ceil(W / BAR_STEP) + 1;
+    const played = silent ? "#3a414d" : s.color;
+    const unplayed = silent ? "#262b34" : hexAlpha(s.color, 0.38);
+    const scale = silent ? 0.35 : gain;      // bar height follows the fader (ghosted when silent)
+    for (let b = firstBar; b < firstBar + nBars; b++) {
+      const x = b * BAR_STEP - view.scrollX;
+      const ta = (b * BAR_STEP) / view.pps, tb = ((b + 1) * BAR_STEP) / view.pps;
+      if (ta >= state.duration) break;
+      const ia = Math.floor(ta * sr / BLOCK), ib = Math.max(ia + 1, Math.ceil(tb * sr / BLOCK));
+      let p = 0;
+      for (let i = ia; i < ib && i < lane.peaks.length; i++) if (lane.peaks[i] > p) p = lane.peaks[i];
+      const h = Math.max(1, Math.min(half, p * half * scale));
+      g.fillStyle = x + BAR_W <= xNow ? played : unplayed;
+      g.fillRect(x, mid - h, BAR_W, h * 2);
+    }
+    g.fillStyle = "#222833"; g.fillRect(0, top + LANE_H - 1, W, 1);
+  });
+
+  // ── Hover line ──
+  if (view.hoverX != null && view.scrubT == null) {
+    g.fillStyle = "rgba(255,255,255,.18)"; g.fillRect(Math.round(view.hoverX), RULER_H, 1, H - RULER_H);
+    const label = fmtTime(xToTime(view.hoverX)), tw = g.measureText(label).width + 10;
+    const lx = clamp(view.hoverX - tw / 2, 0, W - tw);
+    g.fillStyle = "#2a313d"; roundRect(lx, RULER_H + 4, tw, 16, 4); g.fill();
+    g.fillStyle = "#e6e9ef"; g.fillText(label, lx + 5, RULER_H + 7);
+  }
+
+  // ── Playhead (scrub cursor) ──
+  if (xNow >= -8 && xNow <= W + 8) {
+    const x = Math.round(xNow);
+    g.fillStyle = "#ffffff"; g.fillRect(x, 0, 1.5, H);
+    g.beginPath(); g.moveTo(x - 6, 0); g.lineTo(x + 7.5, 0); g.lineTo(x + 0.75, 9); g.closePath(); g.fill();
+  }
+}
+
+function roundRect(x, y, w, h, r) {
+  g.beginPath(); g.moveTo(x + r, y); g.arcTo(x + w, y, x + w, y + h, r); g.arcTo(x + w, y + h, x, y + h, r);
+  g.arcTo(x, y + h, x, y, r); g.arcTo(x, y, x + w, y, r); g.closePath();
+}
+function hexAlpha(hex, a) {
+  const n = parseInt(hex.replace("#", ""), 16);
+  return `rgba(${n >> 16 & 255},${n >> 8 & 255},${n & 255},${a})`;
+}
+
+/* Animation loop while playing: move playhead, keep it in view, stop at the end. */
+function loop() {
+  if (!player.playing) return;
+  const t = player.time();
+  if (t >= state.duration) { player.pause(); player.pausedAt = state.duration; draw(); updateClock(); return; }
+  if (view.follow && view.scrubT == null) {
+    const x = timeToX(t);
+    if (x > view.width - 30 || x < 0) { view.scrollX = t * view.pps - 30; syncScroll(); }
+  }
+  updateClock(); draw();
+  requestAnimationFrame(loop);
+}
+function updateClock() { $("timeNow").textContent = fmtTime(currentT()); }
+
+/* Click / drag to scrub. Audio pauses while dragging and resumes where you let go. */
+let resumeAfterScrub = false;
+canvas.addEventListener("pointerdown", e => {
+  canvas.setPointerCapture(e.pointerId);
+  resumeAfterScrub = player.playing;
+  if (player.playing) player.pause();
+  view.scrubT = clamp(xToTime(e.offsetX), 0, state.duration);
+  updateClock(); draw();
+});
+canvas.addEventListener("pointermove", e => {
+  view.hoverX = e.offsetX;
+  if (view.scrubT != null) view.scrubT = clamp(xToTime(clamp(e.offsetX, 0, view.width)), 0, state.duration);
+  updateClock(); draw();
+});
+const endScrub = () => {
+  if (view.scrubT == null) return;
+  const t = view.scrubT; view.scrubT = null;
+  player.seek(t);
+  if (resumeAfterScrub) player.play();
+  updateClock();
+};
+canvas.addEventListener("pointerup", endScrub);
+canvas.addEventListener("pointercancel", endScrub);
+canvas.addEventListener("pointerleave", () => { view.hoverX = null; draw(); });
+
+/* ════════════════════════════════════════════════════════════════════
+   Transport + keyboard
+   ════════════════════════════════════════════════════════════════════ */
+$("playBtn").addEventListener("click", () => player.toggle());
+$("stopBtn").addEventListener("click", () => { player.seek(0); view.scrollX = 0; syncScroll(); updateClock(); draw(); });
+const editorOpen = () => !$("editorSection").classList.contains("hidden");
+window.addEventListener("keydown", e => {
+  if (!editorOpen() || e.target.matches("input[type=text], textarea")) return;
+  if (e.code === "Space") { e.preventDefault(); e.target.blur?.(); player.toggle(); }
+  else if (e.code === "ArrowRight" && !e.target.matches("input[type=range]")) { e.preventDefault(); player.seek(player.time() + 5); updateClock(); }
+  else if (e.code === "ArrowLeft" && !e.target.matches("input[type=range]")) { e.preventDefault(); player.seek(player.time() - 5); updateClock(); }
+  else if (e.code === "Home") { e.preventDefault(); $("stopBtn").click(); }
+});
+window.addEventListener("keyup", e => { if (e.code === "Space" && editorOpen()) e.preventDefault(); });
+
+/* ════════════════════════════════════════════════════════════════════
+   7. Downloads
+   ════════════════════════════════════════════════════════════════════ */
+$("mixBtn").addEventListener("click", async () => {
+  const btn = $("mixBtn"), txt = $("mixBtnText");
+  const v = effectiveGain("vocals").toFixed(3), i = effectiveGain("instrumental").toFixed(3);
+  btn.disabled = true; txt.textContent = "Rendering mix…";
+  try {
+    const res = await fetch(`/api/jobs/${state.jobId}/mix.mp3?vocals=${v}&instrumental=${i}`);
+    if (!res.ok) throw new Error((await res.json().catch(() => ({}))).detail || `HTTP ${res.status}`);
+    const blob = await res.blob();
+    const name = filenameFromHeader(res.headers.get("Content-Disposition")) || "mix.mp3";
+    const url = URL.createObjectURL(blob);
+    const a = Object.assign(document.createElement("a"), { href: url, download: name });
+    document.body.appendChild(a); a.click(); a.remove();
+    setTimeout(() => URL.revokeObjectURL(url), 10000);
+  } catch (e) { toast("Mix export failed: " + e.message); }
+  btn.disabled = false; txt.textContent = "Download Mixed MP3";
+});
+function filenameFromHeader(h) {
+  if (!h) return null;
+  const star = /filename\*=(?:UTF-8|utf-8)''([^;]+)/.exec(h);
+  if (star) return decodeURIComponent(star[1]);
+  const plain = /filename="?([^";]+)"?/.exec(h);
+  return plain ? plain[1] : null;
+}
+
+/* ════════════════════════════════════════════════════════════════════
+   Open / reset the editor
+   ════════════════════════════════════════════════════════════════════ */
+function openEditor() {
+  show($("progressSection"), false); show($("editorSection"));
+  $("trackName").textContent = state.filename;
+  $("timeTotal").textContent = fmtTime(state.duration);
+  $("dlVocals").href = `/api/jobs/${state.jobId}/vocals.mp3?download=1`;
+  $("dlInst").href = `/api/jobs/${state.jobId}/instrumental.mp3?download=1`;
+  player.pausedAt = 0; view.scrollX = 0; view.pps = 0;   // pps 0 → resizeCanvas() snaps to "fit"
+  buildLaneHeaders(); applyGains();
+  resizeCanvas(); setZoom(view.minPps); updateClock(); updatePlayButton();
+}
+
+$("newFileBtn").addEventListener("click", () => {
+  player.pause(); player.pausedAt = 0;
+  show($("editorSection"), false); show($("uploadSection"));
+});
+</script>
+</body>
+</html>
